@@ -1,0 +1,27 @@
+{
+  "chain_name": "pokerchain",
+  "api": [{ "provider": "local", "address": "http://localhost:1317" }],
+  "rpc": [{ "provider": "local", "address": "http://localhost:26657" }],
+  "sdk_version": "0.53.6",
+  "coin_type": "118",
+  "min_tx_fee": "0",
+  "addr_prefix": "xpoker",
+  "logo": "/logos/pokerchain.svg",
+  "theme_color": "#e5484d",
+  "assets": [
+    {
+      "base": "stake",
+      "symbol": "STAKE",
+      "exponent": "0",
+      "coingecko_id": "",
+      "logo": "/logos/pokerchain.svg"
+    },
+    {
+      "base": "token",
+      "symbol": "TOKEN",
+      "exponent": "0",
+      "coingecko_id": "",
+      "logo": "/logos/pokerchain.svg"
+    }
+  ]
+}
