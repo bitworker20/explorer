@@ -10,9 +10,9 @@
   "theme_color": "#e5484d",
   "assets": [
     {
-      "base": "stake",
-      "symbol": "STAKE",
-      "exponent": "0",
+      "base": "uchip",
+      "symbol": "CHIP",
+      "exponent": "6",
       "coingecko_id": "",
       "logo": "/logos/pokerchain.svg"
     },
