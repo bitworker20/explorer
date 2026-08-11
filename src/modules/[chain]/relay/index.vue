@@ -2,12 +2,14 @@
 import { computed, onMounted, ref } from 'vue';
 import { useBaseStore, useBlockchain, useFormatter } from '@/stores';
 import {
+  coveredSessions,
+  fetchPokerchainParams,
   fetchRelays,
-  probeRelay,
-  probeDisagreement,
+  quoteFraction,
+  relayIsFree,
   relayStatusColor,
   shortRelayStatus,
-  type ProbeResult,
+  type PokerchainParams,
   type Relay,
 } from './relay';
 
@@ -18,10 +20,9 @@ const baseStore = useBaseStore();
 const format = useFormatter();
 
 const relays = ref([] as Relay[]);
-const probes = ref({} as Record<string, ProbeResult>);
+const params = ref(null as PokerchainParams | null);
 const error = ref('');
 const loading = ref(true);
-const probingAll = ref(false);
 
 const bondDenom = computed(() => chainStore.current?.assets?.[0]?.base || 'uchip');
 const latestHeight = computed(() => Number(baseStore.latest?.block?.header?.height || 0));
@@ -30,11 +31,12 @@ const stats = computed(() => {
   const count = (...names: string[]) =>
     relays.value.filter((r) => names.includes(shortRelayStatus(r.status))).length;
   const bond = relays.value.reduce((sum, r) => sum + Number(r.bond_amount || 0), 0);
+  const serving = relays.value.reduce((sum, r) => sum + Number(r.active_session_count || 0), 0);
   return {
     total: relays.value.length,
     active: count('ACTIVE'),
     degraded: count('DRAINING', 'OFFLINE', 'STALE', 'UNBONDING'),
-    jailed: count('JAILED'),
+    serving,
     bond: format.formatToken({ amount: String(bond), denom: bondDenom.value }),
   };
 });
@@ -44,6 +46,14 @@ async function load() {
   error.value = '';
   try {
     relays.value = await fetchRelays(chainStore.endpoint.address);
+    // Params decide how a relay reads: what its bond covers, and where its
+    // quote sits against the ceilings. A params failure must not hide the
+    // registry itself.
+    try {
+      params.value = await fetchPokerchainParams(chainStore.endpoint.address);
+    } catch {
+      params.value = null;
+    }
   } catch (e: any) {
     error.value = e?.message || 'failed to load relays';
   } finally {
@@ -51,19 +61,26 @@ async function load() {
   }
 }
 
-async function probe(relay: Relay) {
-  probes.value = { ...probes.value, [relay.relay_id]: { state: 'probing' } };
-  const result = await probeRelay(relay);
-  probes.value = { ...probes.value, [relay.relay_id]: result };
+function covers(relay: Relay): string {
+  const n = coveredSessions(relay, params.value);
+  return n === null ? '∞' : String(n);
 }
 
-async function probeAll() {
-  probingAll.value = true;
-  try {
-    await Promise.all(relays.value.map((r) => probe(r)));
-  } finally {
-    probingAll.value = false;
-  }
+function priceLabel(relay: Relay): string {
+  if (relayIsFree(relay)) return 'free';
+  const parts = [];
+  if (Number(relay.fee_flat || 0)) parts.push(format.formatToken({ amount: relay.fee_flat, denom: bondDenom.value }));
+  if (Number(relay.fee_bps || 0)) parts.push(`${Number(relay.fee_bps) / 100}% of pot`);
+  return parts.join(' + ');
+}
+
+// Cheap relays win more assignments, so colour the quote by where it sits
+// between free and the ceiling rather than by its absolute size.
+function priceClass(relay: Relay): string {
+  const fraction = quoteFraction(relay, params.value);
+  if (fraction === null) return '';
+  if (fraction === 0) return 'text-success';
+  return fraction >= 0.75 ? 'text-warning' : '';
 }
 
 function heartbeatAge(relay: Relay): string {
@@ -73,10 +90,7 @@ function heartbeatAge(relay: Relay): string {
   return `${height} (-${latestHeight.value - height})`;
 }
 
-onMounted(async () => {
-  await load();
-  if (relays.value.length) await probeAll();
-});
+onMounted(load);
 </script>
 
 <template>
@@ -95,8 +109,8 @@ onMounted(async () => {
         <div class="text-2xl font-semibold text-warning">{{ stats.degraded }}</div>
       </div>
       <div class="bg-base-100 rounded shadow p-4">
-        <div class="text-xs text-gray-500 uppercase">Jailed</div>
-        <div class="text-2xl font-semibold" :class="stats.jailed ? 'text-error' : ''">{{ stats.jailed }}</div>
+        <div class="text-xs text-gray-500 uppercase">Sessions in flight</div>
+        <div class="text-2xl font-semibold">{{ stats.serving }}</div>
       </div>
       <div class="bg-base-100 rounded shadow p-4">
         <div class="text-xs text-gray-500 uppercase">Total Bond</div>
@@ -107,13 +121,7 @@ onMounted(async () => {
     <div class="bg-base-100 rounded shadow">
       <div class="flex items-center justify-between px-4 pt-4">
         <h2 class="text-lg font-semibold">Relays</h2>
-        <div class="flex gap-2">
-          <button class="btn btn-sm" :disabled="loading" @click="load">Reload</button>
-          <button class="btn btn-sm btn-primary" :disabled="probingAll || !relays.length" @click="probeAll">
-            <span v-if="probingAll" class="loading loading-spinner loading-xs mr-1"></span>
-            Probe all
-          </button>
-        </div>
+        <button class="btn btn-sm" :disabled="loading" @click="load">Reload</button>
       </div>
 
       <div v-if="error" class="alert alert-error m-4">{{ error }}</div>
@@ -123,13 +131,13 @@ onMounted(async () => {
           <thead>
             <tr>
               <th>Relay ID</th>
-              <th>Endpoint</th>
               <th>Registered</th>
-              <th class="text-right">Capacity</th>
               <th class="text-right">Bond</th>
-              <th class="text-right">Last heartbeat</th>
+              <th class="text-right">Serving</th>
+              <th>Price</th>
+              <th class="text-right">Missed windows</th>
               <th class="text-right">Slashes</th>
-              <th>Live probe</th>
+              <th class="text-right">Last heartbeat</th>
             </tr>
           </thead>
           <tbody>
@@ -146,55 +154,52 @@ onMounted(async () => {
                 </RouterLink>
                 <div class="text-xs text-gray-500 truncate max-w-[16rem]">{{ relay.owner }}</div>
               </td>
-              <td class="truncate max-w-[18rem]">{{ relay.endpoint }}</td>
               <td>
                 <span class="badge badge-sm border-none" :class="relayStatusColor(relay.status)">
                   {{ shortRelayStatus(relay.status) }}
                 </span>
               </td>
-              <td class="text-right">{{ relay.capacity }}</td>
-              <td class="text-right">{{ format.formatToken({ amount: relay.bond_amount, denom: bondDenom }) }}</td>
-              <td class="text-right whitespace-nowrap">{{ heartbeatAge(relay) }}</td>
+              <td class="text-right whitespace-nowrap">
+                {{ format.formatToken({ amount: relay.bond_amount, denom: bondDenom }) }}
+                <div v-if="Number(relay.unbonding_amount)" class="text-xs text-warning">
+                  +{{ format.formatToken({ amount: relay.unbonding_amount, denom: bondDenom }) }} unbonding
+                </div>
+              </td>
+              <td class="text-right whitespace-nowrap">
+                {{ relay.active_session_count }} / {{ covers(relay) }}
+              </td>
+              <td class="whitespace-nowrap" :class="priceClass(relay)">{{ priceLabel(relay) }}</td>
+              <td
+                class="text-right"
+                :class="Number(relay.assignment_miss_count) ? 'text-warning font-semibold' : ''"
+              >
+                {{ relay.assignment_miss_count }}
+              </td>
               <td class="text-right" :class="Number(relay.slash_count) ? 'text-error font-semibold' : ''">
                 {{ relay.slash_count }}
               </td>
-              <td>
-                <div class="flex items-center gap-2">
-                  <span
-                    v-if="!probes[relay.relay_id] || probes[relay.relay_id].state === 'idle'"
-                    class="text-gray-400"
-                    >—</span
-                  >
-                  <span v-else-if="probes[relay.relay_id].state === 'probing'" class="loading loading-spinner loading-xs"></span>
-                  <span v-else-if="probes[relay.relay_id].state === 'ok'" class="text-success whitespace-nowrap">
-                    ✓ {{ probes[relay.relay_id].latencyMs }}ms
-                    <span class="text-gray-500">
-                      · {{ probes[relay.relay_id].live?.active_sessions }} sessions ·
-                      {{ (probes[relay.relay_id].live?.status || '').toLowerCase() }}
-                    </span>
-                  </span>
-                  <span
-                    v-else
-                    class="text-error whitespace-nowrap tooltip tooltip-left"
-                    :data-tip="probes[relay.relay_id].error"
-                  >
-                    ✗ {{ probes[relay.relay_id].state }}
-                  </span>
-                  <button class="btn btn-xs" @click="probe(relay)">Probe</button>
-                </div>
-                <div v-if="probeDisagreement(relay, probes[relay.relay_id])" class="text-xs text-warning mt-1">
-                  ⚠ {{ probeDisagreement(relay, probes[relay.relay_id]) }}
-                </div>
-              </td>
+              <td class="text-right whitespace-nowrap">{{ heartbeatAge(relay) }}</td>
             </tr>
           </tbody>
         </table>
       </div>
 
-      <div class="px-4 pb-4 text-xs text-gray-500">
-        Probing runs in your browser against each relay's <code>/status/signed</code> endpoint; nothing is written on
-        chain. Two things read as unreachable without the relay being down: a plaintext <code>ws://</code> relay probed
-        from an https page (mixed content), and a relay running a daemon build older than cross-origin status support.
+      <div class="px-4 pb-4 text-xs text-gray-500 space-y-1">
+        <p>
+          Relays no longer publish an endpoint (ADR-007): the chain records who a relay is, not where it is, and the
+          address reaches only the two players of a session, encrypted. There is therefore nothing here to probe — and
+          nothing for anyone else to scan.
+        </p>
+        <p>
+          <strong>Missed windows</strong> is what replaced probing, and it is stronger evidence: it counts the times a
+          relay was assigned a session and let its claim window expire, so it measures work refused rather than a
+          synthetic ping. Both counters decay back toward zero over
+          <code>relay_slash_decay_blocks</code>{{ params?.relay_slash_decay_blocks ? ` (${params.relay_slash_decay_blocks} blocks)` : '' }}.
+        </p>
+        <p>
+          <strong>Serving</strong> is sessions in flight against what the bond covers, and <strong>Price</strong> is the
+          relay's own quote — capped by governance, and cheaper quotes win more assignments.
+        </p>
       </div>
     </div>
   </div>

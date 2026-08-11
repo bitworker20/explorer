@@ -68,7 +68,23 @@ export interface GameSession {
   relay_reward_shares: RelayRewardShare[];
   relay_fee_bps_snapshot: string;
   relay_fee_cap_snapshot: string;
-  relay_backup_fee_bps_snapshot: string;
+  // ADR-007 §3.1: which assigned relay actually answered, and when. nil until
+  // one does — the transport does not exist before that.
+  relay_endpoint_answer?: RelayEndpointAnswer | null;
+  created_height: string;
+  // Height at/after which an unanswered session can be voided and both stakes
+  // refunded. 0 = the answer protocol was disabled when this session matched.
+  relay_answer_deadline_height: string;
+}
+
+// The accepted answer. blob_a/blob_b are opaque here by design: each is
+// readable only by the player it was encrypted to.
+export interface RelayEndpointAnswer {
+  relay_id: string;
+  answered_height: string;
+  // 0 = the assigned primary answered; 1+ = a backup was promoted after the
+  // primary let its claim window lapse.
+  rank: number;
 }
 
 export interface SessionEvidence {

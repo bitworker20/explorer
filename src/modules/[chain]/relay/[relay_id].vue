@@ -2,16 +2,16 @@
 import { computed, onMounted, ref } from 'vue';
 import { useBaseStore, useBlockchain, useFormatter } from '@/stores';
 import {
+  coveredSessions,
   derivedRelayId,
+  fetchPokerchainParams,
   fetchRelay,
   fetchRelayChallenges,
-  probeRelay,
-  probeDisagreement,
-  relayStatusBase,
+  relayIsFree,
   relayStatusColor,
   shortChallengeStatus,
   shortRelayStatus,
-  type ProbeResult,
+  type PokerchainParams,
   type Relay,
   type RelayChallenge,
 } from './relay';
@@ -24,18 +24,44 @@ const format = useFormatter();
 
 const relay = ref(undefined as Relay | undefined);
 const challenges = ref([] as RelayChallenge[]);
-const probe = ref(undefined as ProbeResult | undefined);
+const params = ref(null as PokerchainParams | null);
 const error = ref('');
 
 const bondDenom = computed(() => chainStore.current?.assets?.[0]?.base || 'uchip');
 const latestHeight = computed(() => Number(baseStore.latest?.block?.header?.height || 0));
-const statusBase = computed(() => (relay.value ? relayStatusBase(relay.value.endpoint) : null));
+const covers = computed(() => (relay.value ? coveredSessions(relay.value, params.value) : null));
 const selfCertifying = computed(() => {
   if (!relay.value) return undefined;
   const derived = derivedRelayId(relay.value.pubkey);
   return derived ? derived === relay.value.relay_id : undefined;
 });
-const disagreement = computed(() => (relay.value ? probeDisagreement(relay.value, probe.value) : null));
+// The original banner compared the registry against a live probe. That
+// comparison is gone with the endpoint, but the on-chain evidence still shows
+// the same class of contradiction: a relay that claims to be serving while
+// dropping the sessions it is handed, or one whose bond is fully committed.
+const serviceWarning = computed(() => {
+  const r = relay.value;
+  if (!r) return null;
+  if (shortRelayStatus(r.status) === 'ACTIVE' && Number(r.assignment_miss_count || 0) > 0) {
+    return `registered ACTIVE but has let ${r.assignment_miss_count} assigned claim window(s) lapse` +
+      (Number(r.last_miss_height) ? ` (last at block ${r.last_miss_height})` : '');
+  }
+  if (covers.value !== null && Number(r.active_session_count || 0) >= covers.value) {
+    return 'bond is fully committed — this relay will not be assigned further sessions until one settles';
+  }
+  return null;
+});
+
+const price = computed(() => {
+  if (!relay.value) return '';
+  if (relayIsFree(relay.value)) return 'free';
+  const parts = [];
+  if (Number(relay.value.fee_flat || 0)) {
+    parts.push(format.formatToken({ amount: relay.value.fee_flat, denom: bondDenom.value }));
+  }
+  if (Number(relay.value.fee_bps || 0)) parts.push(`${Number(relay.value.fee_bps) / 100}% of pot`);
+  return parts.join(' + ');
+});
 
 function height(value?: string): string {
   const h = Number(value || 0);
@@ -49,21 +75,17 @@ async function load() {
   try {
     relay.value = await fetchRelay(chainStore.endpoint.address, props.relay_id);
     challenges.value = await fetchRelayChallenges(chainStore.endpoint.address, props.relay_id);
+    try {
+      params.value = await fetchPokerchainParams(chainStore.endpoint.address);
+    } catch {
+      params.value = null;
+    }
   } catch (e: any) {
     error.value = e?.message || 'failed to load relay';
   }
 }
 
-async function runProbe() {
-  if (!relay.value) return;
-  probe.value = { state: 'probing' };
-  probe.value = await probeRelay(relay.value);
-}
-
-onMounted(async () => {
-  await load();
-  if (relay.value) await runProbe();
-});
+onMounted(load);
 </script>
 
 <template>
@@ -76,8 +98,8 @@ onMounted(async () => {
         <span class="badge border-none" :class="relayStatusColor(relay.status)">{{ shortRelayStatus(relay.status) }}</span>
       </div>
 
-      <div v-if="disagreement" class="alert alert-warning mb-4">
-        <span>⚠ Registry and relay disagree: {{ disagreement }}</span>
+      <div v-if="serviceWarning" class="alert alert-warning mb-4">
+        <span>⚠ {{ serviceWarning }}</span>
       </div>
 
       <div class="grid md:!grid-cols-2 gap-4">
@@ -92,10 +114,6 @@ onMounted(async () => {
                     {{ relay.owner }}
                   </RouterLink>
                 </td>
-              </tr>
-              <tr>
-                <td class="text-gray-500">Endpoint</td>
-                <td class="text-right break-all">{{ relay.endpoint }}</td>
               </tr>
               <tr>
                 <td class="text-gray-500">Pubkey (ed25519)</td>
@@ -114,8 +132,24 @@ onMounted(async () => {
                 <td class="text-right">{{ relay.capacity }}</td>
               </tr>
               <tr>
+                <td class="text-gray-500">Price</td>
+                <td class="text-right">{{ price }}</td>
+              </tr>
+              <tr>
                 <td class="text-gray-500">Bond</td>
-                <td class="text-right">{{ format.formatToken({ amount: relay.bond_amount, denom: bondDenom }) }}</td>
+                <td class="text-right">
+                  {{ format.formatToken({ amount: relay.bond_amount, denom: bondDenom }) }}
+                  <span v-if="covers !== null" class="text-xs text-gray-500 block">
+                    covers {{ covers }} concurrent session(s)
+                  </span>
+                </td>
+              </tr>
+              <tr v-if="Number(relay.unbonding_amount)">
+                <td class="text-gray-500">Unbonding</td>
+                <td class="text-right text-warning">
+                  {{ format.formatToken({ amount: relay.unbonding_amount, denom: bondDenom }) }}
+                  <span class="text-xs text-gray-500 block">still slashable until withdrawn</span>
+                </td>
               </tr>
               <tr>
                 <td class="text-gray-500">Bonded height</td>
@@ -147,68 +181,49 @@ onMounted(async () => {
         </div>
 
         <div class="bg-base-100 rounded shadow p-4">
-          <div class="flex items-center justify-between mb-3">
-            <h2 class="text-lg font-semibold">Live status</h2>
-            <button class="btn btn-sm btn-primary" :disabled="probe?.state === 'probing'" @click="runProbe">
-              <span v-if="probe?.state === 'probing'" class="loading loading-spinner loading-xs mr-1"></span>
-              Probe
-            </button>
-          </div>
+          <h2 class="text-lg font-semibold mb-3">Service and reputation</h2>
 
-          <div v-if="!probe || probe.state === 'probing'" class="text-gray-400">Probing {{ statusBase }}/status/signed…</div>
-
-          <div v-else-if="probe.state !== 'ok'" class="alert alert-error">
-            <span>{{ probe.state }}: {{ probe.error }}</span>
-          </div>
-
-          <table v-else class="table table-compact w-full">
+          <table class="table table-compact w-full">
             <tbody>
               <tr>
-                <td class="text-gray-500">Reachable</td>
-                <td class="text-right text-success">✓ {{ probe.latencyMs }} ms</td>
-              </tr>
-              <tr>
-                <td class="text-gray-500">Reports status</td>
-                <td class="text-right">{{ probe.live?.status }}</td>
-              </tr>
-              <tr>
-                <td class="text-gray-500">Reports relay id</td>
-                <td class="text-right break-all">{{ probe.live?.relay_id }}</td>
-              </tr>
-              <tr>
-                <td class="text-gray-500">Active sessions</td>
-                <td class="text-right">{{ probe.live?.active_sessions }}</td>
-              </tr>
-              <tr>
-                <td class="text-gray-500">Active connections</td>
-                <td class="text-right">{{ probe.live?.active_connections }}</td>
-              </tr>
-              <tr v-if="probe.signed">
-                <td class="text-gray-500">Signing key</td>
+                <td class="text-gray-500">Sessions in flight</td>
                 <td class="text-right">
-                  <span v-if="probe.pubkeyMatches" class="text-success">✓ registered pubkey</span>
-                  <span v-else class="text-error">✗ differs from registered pubkey</span>
+                  {{ relay.active_session_count }}
+                  <span v-if="covers !== null" class="text-gray-500">/ {{ covers }} covered by the bond</span>
                 </td>
               </tr>
-              <tr v-if="probe.signed">
-                <td class="text-gray-500">Status signature</td>
-                <td class="text-right">
-                  <span v-if="probe.signatureValid === true" class="text-success">✓ verified</span>
-                  <span v-else-if="probe.signatureValid === false" class="text-error">✗ invalid</span>
-                  <span v-else class="text-gray-400">not verified</span>
-                  <span v-if="probe.signatureNote" class="text-xs text-gray-500 block">{{ probe.signatureNote }}</span>
+              <tr>
+                <td class="text-gray-500">Missed claim windows</td>
+                <td class="text-right" :class="Number(relay.assignment_miss_count) ? 'text-warning font-semibold' : ''">
+                  {{ relay.assignment_miss_count }}
+                  <span v-if="Number(relay.last_miss_height)" class="text-gray-500 text-xs">
+                    (last at {{ relay.last_miss_height }})
+                  </span>
                 </td>
               </tr>
-              <tr v-else>
-                <td class="text-gray-500">Status signature</td>
-                <td class="text-right text-gray-400">{{ probe.signatureNote || 'unsigned status' }}</td>
+              <tr>
+                <td class="text-gray-500">Advertised capacity</td>
+                <td class="text-right">{{ relay.capacity }}</td>
               </tr>
-              <tr v-if="probe.clockSkewMs !== undefined">
-                <td class="text-gray-500">Clock skew</td>
-                <td class="text-right">{{ probe.clockSkewMs }} ms</td>
+              <tr v-if="params?.relay_slash_decay_blocks && params.relay_slash_decay_blocks !== '0'">
+                <td class="text-gray-500">Penalty decay</td>
+                <td class="text-right">one unit per {{ params.relay_slash_decay_blocks }} blocks</td>
               </tr>
             </tbody>
           </table>
+
+          <div class="text-xs text-gray-500 mt-3 space-y-1">
+            <p>
+              This relay's address is not on chain and cannot be probed from here (ADR-007). It reaches the two players
+              of each session it answers, encrypted to each of them, and nobody else.
+            </p>
+            <p>
+              A <strong>missed claim window</strong> is the on-chain replacement for a liveness probe, and a stricter
+              one: it records that this relay was assigned a session and let its window lapse, so a backup had to step
+              in. It measures work refused, not a ping answered — and unlike a probe it cannot be faked by a relay that
+              answers status checks while dropping real sessions.
+            </p>
+          </div>
         </div>
       </div>
 

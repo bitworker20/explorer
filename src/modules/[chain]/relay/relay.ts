@@ -1,4 +1,4 @@
-import { Ed25519, sha256 } from '@cosmjs/crypto';
+import { sha256 } from '@cosmjs/crypto';
 import { fromHex, toBech32 } from '@cosmjs/encoding';
 import { get } from '@/libs';
 
@@ -7,17 +7,44 @@ import { get } from '@/libs';
 export interface Relay {
   relay_id: string;
   owner: string;
-  endpoint: string;
+  // NOTE: there is deliberately no `endpoint`. Under ADR-007 the chain
+  // publishes a relay's identity, not its location: the endpoint reaches the
+  // two players of a session inside an encrypted per-session answer and is
+  // never stored on chain. Nothing here — and no third party — can learn it.
   pubkey: string;
   capacity: string;
   status: string;
   metadata: string;
   bond_amount: string;
   bonded_height: string;
+  // Slice queued by a partial unbonding: out of bond_amount already, but still
+  // slashable until withdrawn (ADR-007 §3.3).
+  unbonding_amount: string;
   unbonding_end_height: string;
   last_heartbeat_height: string;
   slash_count: string;
   last_slashed_height: string;
+  // Claim windows this relay let expire while assigned — real-work liveness
+  // evidence that replaced synthetic probing (ADR-007 §3.1).
+  assignment_miss_count: string;
+  last_miss_height: string;
+  // Sessions it has answered that have not reached a terminal status.
+  active_session_count: string;
+  // The relay's own price, bounded by the governance ceilings (§3.4).
+  fee_flat: string;
+  fee_bps: string;
+}
+
+// The subset of x/pokerchain params the relay pages need to interpret a relay:
+// what its bond covers, and where its quote sits against the ceilings.
+export interface PokerchainParams {
+  relay_min_bond: string;
+  relay_per_session_collateral: string;
+  relay_fee_flat: string;
+  relay_fee_bps: string;
+  relay_slash_decay_blocks: string;
+  relay_claim_window_blocks: string;
+  relay_answer_timeout_blocks: string;
 }
 
 export interface RelayChallenge {
@@ -36,38 +63,6 @@ export interface RelayChallenge {
   bounty_amount: string;
 }
 
-// The relay daemon's /status payload (x/pokerchain/relay/types.go).
-export interface RelayLiveStatus {
-  relay_id: string;
-  status: string;
-  active_sessions: number;
-  active_connections: number;
-}
-
-export interface RelaySignedStatus {
-  chain_id: string;
-  timestamp_unix_millis: number;
-  status: RelayLiveStatus;
-  pubkey: string;
-  signature: string;
-}
-
-export type ProbeState = 'idle' | 'probing' | 'ok' | 'unreachable' | 'blocked' | 'invalid';
-
-export interface ProbeResult {
-  state: ProbeState;
-  latencyMs?: number;
-  live?: RelayLiveStatus;
-  // Only set when the relay answered /status/signed.
-  signed?: boolean;
-  pubkeyMatches?: boolean;
-  signatureValid?: boolean;
-  signatureNote?: string;
-  clockSkewMs?: number;
-  error?: string;
-}
-
-const PROBE_TIMEOUT_MS = 4000;
 const RELAY_ID_HRP = 'relay';
 const ED25519_PUBKEY_BYTES = 32;
 
@@ -91,150 +86,6 @@ export async function fetchRelayChallenges(restBase: string, relayId: string): P
     `${relayRestBase(restBase)}/pokerchain/pokerchain/v1/relay-challenges?relay_id=${relayId}`
   );
   return data?.challenges || [];
-}
-
-// The registry stores a WebSocket endpoint (ws://host:9080/relay). Its status
-// surface is the same host over plain HTTP, so map the scheme and drop the path.
-export function relayStatusBase(endpoint: string): string | null {
-  const scheme: Record<string, string> = {
-    'ws:': 'http:',
-    'wss:': 'https:',
-    'http:': 'http:',
-    'https:': 'https:',
-  };
-  try {
-    const url = new URL(endpoint.trim());
-    const mapped = scheme[url.protocol];
-    if (!mapped) return null;
-    url.protocol = mapped;
-    url.pathname = '';
-    url.search = '';
-    url.hash = '';
-    return url.toString().replace(/\/+$/, '');
-  } catch {
-    return null;
-  }
-}
-
-// A page served over https cannot reach a plaintext relay: the browser blocks
-// the request before it leaves, which would otherwise read as "relay is down".
-function blockedByMixedContent(statusBase: string): boolean {
-  return (
-    typeof window !== 'undefined' &&
-    window.location.protocol === 'https:' &&
-    statusBase.startsWith('http:')
-  );
-}
-
-async function getJSON(url: string): Promise<{ ok: boolean; httpStatus: number; body?: any }> {
-  const abort = new AbortController();
-  const timer = setTimeout(() => abort.abort(), PROBE_TIMEOUT_MS);
-  try {
-    const resp = await fetch(url, { signal: abort.signal, mode: 'cors' });
-    if (!resp.ok) return { ok: false, httpStatus: resp.status };
-    return { ok: true, httpStatus: resp.status, body: await resp.json() };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// Rebuilds the bytes the relay signed, per SignedStatusSignBytes in
-// x/pokerchain/relay/server.go. Any drift here shows up as an invalid signature.
-function signedStatusSignBytes(signed: RelaySignedStatus): Uint8Array {
-  const text =
-    'bitpoker-relay-status-v1\n' +
-    signed.chain_id +
-    '\n' +
-    signed.status.relay_id +
-    '\n' +
-    signed.status.status +
-    '\n' +
-    signed.status.active_sessions +
-    '\n' +
-    signed.status.active_connections +
-    '\n' +
-    signed.timestamp_unix_millis;
-  return new TextEncoder().encode(text);
-}
-
-async function verifySignedStatus(
-  signed: RelaySignedStatus,
-  result: ProbeResult,
-  onChainPubkey: string
-): Promise<void> {
-  const reported = (signed.pubkey || '').toLowerCase();
-  result.pubkeyMatches = reported.length > 0 && reported === (onChainPubkey || '').trim().toLowerCase();
-
-  let pubkey: Uint8Array;
-  let signature: Uint8Array;
-  try {
-    pubkey = fromHex(reported);
-    signature = fromHex(signed.signature || '');
-  } catch {
-    result.signatureValid = false;
-    result.signatureNote = 'pubkey or signature is not valid hex';
-    return;
-  }
-
-  // ADR-006 unified the relay node key on ed25519; a relay still running the
-  // legacy secp256k1 status key can be reported but not verified here.
-  if (pubkey.length !== ED25519_PUBKEY_BYTES) {
-    result.signatureNote = `not an ed25519 pubkey (${pubkey.length} bytes)`;
-    return;
-  }
-
-  try {
-    result.signatureValid = await Ed25519.verifySignature(signature, signedStatusSignBytes(signed), pubkey);
-  } catch (e: any) {
-    result.signatureValid = false;
-    result.signatureNote = e?.message || 'signature verification failed';
-  }
-}
-
-export async function probeRelay(relay: Relay): Promise<ProbeResult> {
-  const base = relayStatusBase(relay.endpoint);
-  if (!base) {
-    return { state: 'invalid', error: 'endpoint is not a ws/wss/http/https URL' };
-  }
-  if (blockedByMixedContent(base)) {
-    return {
-      state: 'blocked',
-      error: 'the browser blocks a plaintext relay from an https page (mixed content)',
-    };
-  }
-
-  const started = performance.now();
-  try {
-    const signedResp = await getJSON(`${base}/status/signed`);
-    if (signedResp.ok) {
-      const signed = signedResp.body as RelaySignedStatus;
-      const result: ProbeResult = {
-        state: 'ok',
-        latencyMs: Math.round(performance.now() - started),
-        live: signed.status,
-        signed: true,
-        clockSkewMs: Date.now() - Number(signed.timestamp_unix_millis),
-      };
-      await verifySignedStatus(signed, result, relay.pubkey);
-      return result;
-    }
-
-    // 503 means the relay serves status but has no signing key configured.
-    const plainResp = await getJSON(`${base}/status`);
-    if (plainResp.ok) {
-      return {
-        state: 'ok',
-        latencyMs: Math.round(performance.now() - started),
-        live: plainResp.body as RelayLiveStatus,
-        signed: false,
-        signatureNote: 'relay does not serve /status/signed',
-      };
-    }
-    return { state: 'unreachable', error: `HTTP ${plainResp.httpStatus}` };
-  } catch (e: any) {
-    const reason = e?.name === 'AbortError' ? `timeout after ${PROBE_TIMEOUT_MS}ms` : e?.message || 'request failed';
-    return { state: 'unreachable', error: reason };
-  }
 }
 
 // relay_id = bech32("relay", sha256(ed25519_pubkey)[:20]) — ADR-006 §2.2. The
@@ -275,29 +126,40 @@ export function relayStatusColor(status: string): string {
   }
 }
 
-// The disagreements worth surfacing: the registry says one thing, the relay
-// itself says another. This is the raw material of a relay challenge.
-export function probeDisagreement(relay: Relay, probe?: ProbeResult): string | null {
-  if (!probe || probe.state === 'idle' || probe.state === 'probing') return null;
-  const onChain = shortRelayStatus(relay.status);
+export async function fetchPokerchainParams(restBase: string): Promise<PokerchainParams | null> {
+  const data = await get(`${relayRestBase(restBase)}/pokerchain/pokerchain/v1/params`);
+  return data?.params || null;
+}
 
-  if (probe.state === 'unreachable' && onChain === 'ACTIVE') {
-    return 'registered ACTIVE but does not answer';
-  }
-  if (probe.state !== 'ok' || !probe.live) return null;
+// How many sessions this bond covers at once. Returns null when the chain does
+// not price concurrency (relay_per_session_collateral = 0), where the honest
+// answer is "unbounded", not "zero".
+export function coveredSessions(relay: Relay, params?: PokerchainParams | null): number | null {
+  const collateral = Number(params?.relay_per_session_collateral || 0);
+  if (!collateral) return null;
+  return Math.floor(Number(relay.bond_amount || 0) / collateral);
+}
 
-  const live = (probe.live.status || '').toUpperCase();
-  if (onChain === 'ACTIVE' && live !== 'ACTIVE') {
-    return `registered ACTIVE but reports ${live}`;
-  }
-  if (probe.signed && probe.pubkeyMatches === false) {
-    return 'signs status with a key that is not the registered pubkey';
-  }
-  if (probe.signed && probe.signatureValid === false) {
-    return 'signed status fails verification';
-  }
-  if (probe.live.relay_id && probe.live.relay_id !== relay.relay_id) {
-    return `answers as ${probe.live.relay_id}`;
-  }
-  return null;
+// A relay's quote for a pot, in the escrow denom. Mirrors quotedRake in the
+// keeper; the pot is 2x the stake.
+export function quotedRake(relay: Relay, pot: number): number {
+  return Number(relay.fee_flat || 0) + Math.floor((pot * Number(relay.fee_bps || 0)) / 10000);
+}
+
+// Where a quote sits between free and the governance ceiling, 0..1. Undercutting
+// buys assignment weight, so this is the number that predicts volume — not the
+// raw fee. null when governance allows no fee at all (nothing to compare to).
+export function quoteFraction(relay: Relay, params?: PokerchainParams | null): number | null {
+  const ceilFlat = Number(params?.relay_fee_flat || 0);
+  const ceilBps = Number(params?.relay_fee_bps || 0);
+  if (!ceilFlat && !ceilBps) return null;
+  const flat = Number(relay.fee_flat || 0);
+  const bps = Number(relay.fee_bps || 0);
+  const ceilingScore = ceilFlat + ceilBps;
+  if (!ceilingScore) return null;
+  return Math.min(1, (flat + bps) / ceilingScore);
+}
+
+export function relayIsFree(relay: Relay): boolean {
+  return !Number(relay.fee_flat || 0) && !Number(relay.fee_bps || 0);
 }

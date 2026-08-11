@@ -173,15 +173,47 @@ onMounted(load);
                 <td class="text-right break-all">{{ session.relay_assignment.backup_relays.join(', ') }}</td>
               </tr>
               <tr>
+                <td class="text-gray-500">Answered by</td>
+                <td class="text-right break-all">
+                  <template v-if="session.relay_endpoint_answer?.relay_id">
+                    <RouterLink
+                      class="text-primary"
+                      :to="`/${chain}/relay/${session.relay_endpoint_answer.relay_id}`"
+                    >
+                      {{ session.relay_endpoint_answer.relay_id }}
+                    </RouterLink>
+                    <span class="text-xs text-gray-500 block">
+                      <template v-if="Number(session.relay_endpoint_answer.rank)">
+                        promoted backup (rank {{ session.relay_endpoint_answer.rank }}) — the primary let its claim
+                        window lapse
+                      </template>
+                      <template v-else>the assigned primary</template>
+                      · block {{ session.relay_endpoint_answer.answered_height }}
+                    </span>
+                  </template>
+                  <span v-else-if="Number(session.relay_answer_deadline_height)" class="text-warning">
+                    not yet — voidable from block {{ session.relay_answer_deadline_height }}
+                  </span>
+                  <span v-else class="text-gray-400">—</span>
+                </td>
+              </tr>
+              <tr>
                 <td class="text-gray-500">Relay reward</td>
                 <td class="text-right">
                   {{ token(session.relay_reward) }}
                   <span v-if="session.relay_reward_claimed" class="badge badge-xs badge-success ml-1">claimed</span>
                 </td>
               </tr>
-              <tr v-if="Number(session.relay_fee_snapshot)">
-                <td class="text-gray-500">Relay fee (flat, locked)</td>
-                <td class="text-right">{{ token(session.relay_fee_snapshot) }}</td>
+              <tr v-if="Number(session.relay_fee_snapshot) || Number(session.relay_fee_bps_snapshot)">
+                <td class="text-gray-500">Price locked at match</td>
+                <td class="text-right">
+                  <span v-if="Number(session.relay_fee_snapshot)">{{ token(session.relay_fee_snapshot) }}</span>
+                  <span v-if="Number(session.relay_fee_bps_snapshot)">
+                    <template v-if="Number(session.relay_fee_snapshot)"> + </template>
+                    {{ Number(session.relay_fee_bps_snapshot) / 100 }}% of pot
+                  </span>
+                  <span class="text-xs text-gray-500 block">the assigned primary's quote when this session matched</span>
+                </td>
               </tr>
             </tbody>
           </table>
