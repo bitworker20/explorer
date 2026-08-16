@@ -156,28 +156,31 @@ export const useIndexModule = defineStore('module-index', {
         {
           title: 'Height',
           color: 'primary',
-          icon: 'mdi-pound',
+          icon: 'mdi-cube-outline',
           stats: String(base?.latest?.block?.header?.height || 0),
           change: 0,
         },
         {
           title: 'Validators',
-          color: 'error',
-          icon: 'mdi-human-queue',
+          // Not 'error': red is what this theme uses for something being
+          // wrong, and a validator count is not a warning.
+          color: 'primary',
+          icon: 'mdi-shield-check-outline',
           stats: String(base?.latest?.block?.last_commit?.signatures.length || 0),
           change: 0,
         },
         {
           title: 'Supply',
           color: 'success',
-          icon: 'mdi-currency-usd',
+          // CHIP is a poker chip, not a dollar.
+          icon: 'mdi-poker-chip',
           stats: formatter.formatTokenAmount(bank.supply),
           change: 0,
         },
         {
           title: 'Bonded Tokens',
           color: 'warning',
-          icon: 'mdi-lock',
+          icon: 'mdi-lock-outline',
           stats: formatter.formatTokenAmount({
             // @ts-ignore
             amount: this.pool.bonded_tokens,
@@ -188,14 +191,14 @@ export const useIndexModule = defineStore('module-index', {
         {
           title: 'Inflation',
           color: 'success',
-          icon: 'mdi-chart-multiple',
+          icon: 'mdi-trending-up',
           stats: formatter.formatDecimalToPercent(mintStore.inflation),
           change: 0,
         },
         {
           title: 'Community Pool',
           color: 'primary',
-          icon: 'mdi-bank',
+          icon: 'mdi-treasure-chest',
           stats: formatter.formatTokens(
             // @ts-ignore
             this.communityPool?.filter((x: Coin) => x.denom === staking.params.bond_denom)

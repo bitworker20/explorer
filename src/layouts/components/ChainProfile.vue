@@ -16,7 +16,11 @@ function changeEndpoint(item: Endpoint) {
   <div class="dropdown">
     <label tabindex="0" class="flex items-center">
       <div class="p-1 relative mr-3 cursor-pointer">
-        <img v-lazy="chainStore.logo" class="w-9 h-9 rounded-full" />
+        <!-- Not v-lazy: this is one small always-visible logo, and
+             lazy-load-vue3 leaves its grey placeholder in place whenever the
+             visibility check does not fire — which reads as a broken image
+             sitting next to the chain height. -->
+        <img :src="chainStore.logo" class="w-9 h-9 rounded-full" />
         <div
           class="w-2 h-2 rounded-full absolute right-0 bottom-0 shadow"
           :class="{

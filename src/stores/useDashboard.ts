@@ -59,7 +59,12 @@ export function convertFromLocal(lc: LocalChainConfig): ChainConfig {
     };
   }
   conf.features = lc.features;
-  conf.logo = lc.logo.startsWith('http') ? lc.logo : `https://ping.pub${lc.logo}`;
+  // A relative logo in chains/ is *this* deployment's own asset, served out of
+  // public/logos. Upstream rewrote it onto ping.pub's host, which in a fork
+  // means every page load fetches a 404 from someone else's CDN and every
+  // place the chain logo appears — the sidebar entry, the height header —
+  // renders as a broken image. Absolute URLs still work: they are used as-is.
+  conf.logo = lc.logo;
   conf.keplrFeatures = lc.keplr_features;
   conf.keplrPriceStep = lc.keplr_price_step;
   conf.themeColor = lc.theme_color;
