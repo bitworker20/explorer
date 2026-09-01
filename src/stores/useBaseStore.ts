@@ -6,8 +6,14 @@ import type { Block } from '@/types';
 import { hashTx } from '@/libs';
 import { fromBase64 } from '@cosmjs/encoding';
 
-// `"false"` is a truthy string, so compare explicitly.
-const FETCH_ALL_BLOCKS = import.meta.env.VITE_FETCH_ALL_BLOCKS === 'true';
+// On by default, unlike upstream. This chain commits a block every ~5s while
+// App.vue polls every 6s, so the tip-only path below reaches the list one block
+// short of the chain each poll: exactly one height in six was never requested,
+// leaving permanent gaps at a steady 30s cadence that looked like the chain had
+// lost blocks. Backfilling is what keeps the list continuous; the extra call is
+// one `/blocks/{height}` per poll. `"false"` is a truthy string, so compare
+// explicitly.
+const FETCH_ALL_BLOCKS = import.meta.env.VITE_FETCH_ALL_BLOCKS !== 'false';
 const RECENT_BLOCKS_LIMIT = Number(import.meta.env.VITE_RECENT_BLOCK_LIMIT) || 50;
 
 export const useBaseStore = defineStore('baseStore', {
@@ -124,8 +130,14 @@ export const useBaseStore = defineStore('baseStore', {
       const oldHeight = Number(this.recents[this.recents.length - 1]?.block?.header?.height);
       const newHeight = Number(this.latest.block.header.height);
       let newBlocks = [];
-      // Fetch all blocks between oldHeight+1 and less than newHeight
-      for (let h = oldHeight + 1; h < newHeight; h++) {
+      // Fetch all blocks between oldHeight+1 and less than newHeight, but never
+      // further back than the list can show. Polling stops while the tab is
+      // hidden (App.vue), so returning to a tab left open for an hour would
+      // otherwise walk every height since it was hidden, one request at a time,
+      // only for the slice below to throw all but the last RECENT_BLOCKS_LIMIT
+      // away. NaN (recents empty, first poll) skips the loop as before.
+      const fromHeight = Math.max(oldHeight + 1, newHeight - RECENT_BLOCKS_LIMIT);
+      for (let h = fromHeight; h < newHeight; h++) {
         const block = await this.fetchBlock(h);
         if (!block?.block?.header?.height) continue; // skip if block not found
         newBlocks.push(block);
